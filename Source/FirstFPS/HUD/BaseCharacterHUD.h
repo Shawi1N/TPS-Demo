@@ -8,6 +8,7 @@
 
 class UTexture2D;
 class UCharacterOverlay;
+class UAnnouncementWidget;
 class UUserWidget;
 
 /** 自定义结构体: 存储每帧要显示的准星纹理 */
@@ -30,10 +31,18 @@ class FIRSTFPS_API ABaseCharacterHUD : public AHUD
 public:
 	/** AHUD类的重载渲染函数, 每帧会被调用一次. 负责在屏幕上显示简单UI元素 */
 	virtual void DrawHUD() override;
-	void AddCharacterOverlay();
+
 	UPROPERTY(EditAnywhere, Category = "Player States")
 	TSubclassOf<UUserWidget> CharacterOverlayClass;
+	UPROPERTY()
 	UCharacterOverlay* CharacterOverlay;
+	void AddCharacterOverlay();
+
+	UPROPERTY(EditAnywhere, Category = "Announcements")
+	TSubclassOf<UUserWidget> AnnouncementClass;
+	UPROPERTY()
+	UAnnouncementWidget* Announcement;
+	void AddAnnouncement();
 
 protected:
 	virtual void BeginPlay() override;

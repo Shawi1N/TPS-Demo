@@ -12,6 +12,7 @@
 #include "FirstFPS/HUD/BaseCharacterHUD.h"
 #include "Camera/CameraComponent.h"
 #include "TimerManager.h"
+#include "Sound/SoundCue.h"
 
 UCombatComponent::UCombatComponent()
 {
@@ -19,6 +20,19 @@ UCombatComponent::UCombatComponent()
 
 	BaseWalkSpeed = 600;
 	AimWalkSpeed = 450;
+}
+
+void UCombatComponent::PickupAmmo(EWeaponType WeaponType, int32 AmmoAmount)
+{
+	/** 处理Character拾取弹药的逻辑 */
+	if (CarriedAmmoMap.Contains(WeaponType)) {
+		CarriedAmmoMap[WeaponType] += AmmoAmount;
+		UpdateCarriedAmmo(); // 更新HUD中的 备用弹药数 显示
+	}
+	if (EquippedWeapon && EquippedWeapon->IsMagEmpty() && EquippedWeapon->GetWeaponType() == WeaponType) {
+		// 如果 当前Weapon 并无弹药, 且 拾取的弹药 与 当前Weapon 类型相对应, 则自动装弹
+		Reloading();
+	}
 }
 
 void UCombatComponent::BeginPlay()
@@ -31,16 +45,37 @@ void UCombatComponent::BeginPlay()
 			DefaultFOV = Character->GetFollowCamera()->FieldOfView;
 			CurrentFOV = DefaultFOV;
 		}
+		if (Character->HasAuthority()) {
+			InitializeCarriedAmmo();
+		}
 	}
 }
 
 void UCombatComponent::SetAiming(bool bIsAiming)
 {
-	bAiming = bIsAiming;		/** 这一步发生在当前本地机器. 所以 Clinet 不需要等 Server 数据返回, 就能立刻看到瞄准动作 */
+	bAiming = bIsAiming;
 	if (Character) {
 		Character->GetCharacterMovement()->MaxWalkSpeed = (bIsAiming ? AimWalkSpeed : BaseWalkSpeed);
 	}
-	ServerSetAiming(bIsAiming); /** 发送 Server RPC, 将状态变量的修改发送到 Server */
+	if (Character->IsLocallyControlled()) {
+		bAimButtonPressed = bAiming;
+	}
+	ServerSetAiming(bIsAiming);
+}
+
+void UCombatComponent::ServerSetAiming_Implementation(bool bIsAiming)
+{
+	bAiming = bIsAiming; // Server 将更新的 bAiming 复制给 其他Clients (变量复制)
+	if (Character) {
+		// 此处只修改 Server 上的权威移动速度MaxWalkSpeed (其余Clients上的对应Character副本不受影响, 因为没有必要)
+		Character->GetCharacterMovement()->MaxWalkSpeed = (bIsAiming ? AimWalkSpeed : BaseWalkSpeed);
+	}
+}
+
+void UCombatComponent::OnRep_Aiming()
+{
+	if (Character && Character->IsLocallyControlled())
+		bAiming = bAimButtonPressed;
 }
 
 void UCombatComponent::FireButtonPressed(bool bPressed)
@@ -56,15 +91,17 @@ void UCombatComponent::FireButtonPressed(bool bPressed)
 
 void UCombatComponent::Fire()
 {
-	if (bCanFire) {
+	if (CanFire()) {
 		bCanFire = false;
 
 		/* 本地机器: 按下开火键时, 准星扩散 */
 		if (EquippedWeapon) {
 			CrosshairShootingFactor = 20.f;
 		}
-		/* Server: 处理开火逻辑, 传入Line Trace目标点 */
-		ServerFire(HitTarget); // 播放 Charcater的开火动作 和 Weapon的开火动画
+
+		/* 参数HitTarget: 用于传入Line Trace目标点 */
+		LocalFire(HitTarget);  // 本地开火效果: 让开火反馈立即发生(Character开火动作;Weapon开火动画), 无需通过Multicast返回来执行
+		ServerFire(HitTarget); // 让处于 Server 或 未控制该Character的Clients 的Character, 播放开火特效
 
 		StartFireTimer(); // 给 FireTimer 注册一个计时器
 	}
@@ -72,23 +109,23 @@ void UCombatComponent::Fire()
 
 void UCombatComponent::ServerFire_Implementation(const FVector_NetQuantize& TraceHitTarget)
 {
-	MulticastFire(TraceHitTarget); // Server 和 所有Clients 播放开火表现	P.S. 所有机器均使用Server传来的同一个TraceHitTarget!
+	MulticastFire(TraceHitTarget); // P.S. 所有机器均使用Server传来的同一个TraceHitTarget!
 }
 
 void UCombatComponent::MulticastFire_Implementation(const FVector_NetQuantize& TraceHitTarget)
 {
-	if (Character && EquippedWeapon) {
-		Character->PlayFireMontage(bAiming);  // 播放 Charcater 的开火动作
-		EquippedWeapon->Fire(TraceHitTarget); // 播放 Weapon 的开火动画
-	}
+	/* LocalFire() 在 本地Clinet控制的Character 上已经执行过. 因此 Server Multicast 时, 无需重复执行 (防止开火特效播放两次) */
+	if (Character && Character->IsLocallyControlled() && !Character->HasAuthority()) return;
+	
+	/* 处于 Server 或 未控制该Character的Clients 中, 触发LocalFire() */
+	LocalFire(TraceHitTarget);
 }
 
-void UCombatComponent::ServerSetAiming_Implementation(bool bIsAiming)
+void UCombatComponent::LocalFire(const FVector_NetQuantize& TraceHitTarget)
 {
-	bAiming = bIsAiming; // Server 将更新的 bAiming 复制给 其他Clients (变量复制)
-	if (Character) {
-		// 此处只修改 Server 上的权威移动速度MaxWalkSpeed (其余Clients上的对应Character副本不受影响, 因为没有必要)
-		Character->GetCharacterMovement()->MaxWalkSpeed = (bIsAiming ? AimWalkSpeed : BaseWalkSpeed); 
+	if (Character && EquippedWeapon && CombatState == ECombatState::ECS_Unoccupied) {
+		Character->PlayFireMontage(bAiming);  // 播放 Charcater 的开火动作
+		EquippedWeapon->Fire(TraceHitTarget); // 播放 Weapon 的开火动画, 处理弹药消耗
 	}
 }
 
@@ -113,22 +150,202 @@ void UCombatComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& Out
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 	
 	DOREPLIFETIME(UCombatComponent, EquippedWeapon);
+	DOREPLIFETIME(UCombatComponent, SecondaryWeapon);
 	DOREPLIFETIME(UCombatComponent, bAiming);
+	DOREPLIFETIME_CONDITION(UCombatComponent, CarriedAmmo, COND_OwnerOnly); // 仅复制给控制该类的Client, 以节省带宽
+	DOREPLIFETIME(UCombatComponent, CombatState);
 }
 
 void UCombatComponent::EquipWeapon(AWeapon* WeaponToEquip)
 {
 	if (Character == nullptr || WeaponToEquip == nullptr) return;
+	if (CombatState != ECombatState::ECS_Unoccupied) return;
 
+	if (EquippedWeapon != nullptr && SecondaryWeapon == nullptr) { // Character 已有主武器, 但没有副武器
+		EquipSecondaryWeapon(WeaponToEquip);
+	}
+	else { // Character 没有装备任何武器 or 主副武器皆已装备
+		EquipPrimaryWeapon(WeaponToEquip);
+	}
+}
+
+void UCombatComponent::SwapWeapons()
+{
+	if (CombatState != ECombatState::ECS_Unoccupied) return; // 可选: 装填状态时, 禁止切换武器
+
+	AWeapon* TempWeapon = EquippedWeapon;
+	EquippedWeapon = SecondaryWeapon;
+	SecondaryWeapon = TempWeapon;
+
+	/* 主武器 */
+	EquippedWeapon->SetWeaponState(EWeaponState::EWS_Equipped);
+	AttachActorToRightHand(EquippedWeapon);
+	EquippedWeapon->SetHUDAmmo();
+	UpdateCarriedAmmo();
+	PlayEquipWeaponSound(EquippedWeapon);
+
+	/* 副武器 */
+	SecondaryWeapon->SetWeaponState(EWeaponState::EWS_EquippedSecondary);
+	AttacgActorToBack(SecondaryWeapon);
+}
+
+void UCombatComponent::EquipPrimaryWeapon(AWeapon* WeaponToEquip)
+{
+	DropEquippedWeapon();
 	EquippedWeapon = WeaponToEquip;
 	EquippedWeapon->SetWeaponState(EWeaponState::EWS_Equipped);
+	AttachActorToRightHand(EquippedWeapon);
+	/** 每个 Actor 都可以设置 Owner. Owner会影响 该Actor 的 Server RPC、OwnerOnly 变量复制... */
+	EquippedWeapon->SetOwner(Character); // Server 调用 SetOwner() 后，Owner 状态可以自动复制
+	/* 装备新Weapon时, 更新HUD弹药数显示 */
+	EquippedWeapon->SetHUDAmmo();
+	UpdateCarriedAmmo();
+	PlayEquipWeaponSound(EquippedWeapon);
+	/* 自动换弹: 装备Weapon后, 如果Weapon没有子弹, 执行Reloading() */
+	if (EquippedWeapon->IsMagEmpty()) {
+		Reloading();
+	}
+}
+
+void UCombatComponent::EquipSecondaryWeapon(AWeapon* WeaponToEquip)
+{
+	SecondaryWeapon = WeaponToEquip;
+	SecondaryWeapon->SetWeaponState(EWeaponState::EWS_EquippedSecondary);
+	AttacgActorToBack(SecondaryWeapon);
+	SecondaryWeapon->SetOwner(Character);
+	PlayEquipWeaponSound(SecondaryWeapon);
+}
+
+void UCombatComponent::DropEquippedWeapon()
+{
+	if (EquippedWeapon) {
+		EquippedWeapon->Dropped(); // 若装备新Weapon时, 已装备Weapon, 先丢弃原有Weapon
+	}
+}
+
+void UCombatComponent::AttachActorToRightHand(AActor* ActorToAttach)
+{
+	if (Character == nullptr || Character->GetMesh() == nullptr || ActorToAttach == nullptr) return;
 	const USkeletalMeshSocket* HandSocket = Character->GetMesh()->GetSocketByName(FName("RightHandSocket"));
 	if (HandSocket) {
 		/** 当 Attach 发生在 Server 的 replicated Actor 上时, UE会把 该Actor 的 AttachmentReplication附着状态 同步到 Clients */
-		HandSocket->AttachActor(EquippedWeapon, Character->GetMesh());
+		HandSocket->AttachActor(ActorToAttach, Character->GetMesh());
 	}
-	/** 每个 Actor 都可以设置 Owner. Owner会影响 该Actor 的 Server RPC、OwnerOnly 变量复制... */
-	EquippedWeapon->SetOwner(Character); // Server 调用 SetOwner() 后，Owner 状态可以自动复制
+}
+
+void UCombatComponent::AttacgActorToBack(AActor* ActorToAttach)
+{
+	if (Character == nullptr || Character->GetMesh() == nullptr || ActorToAttach == nullptr) return;
+	const USkeletalMeshSocket* HandSocket = Character->GetMesh()->GetSocketByName(FName("BackSocket"));
+	if (HandSocket) {
+		/** 当 Attach 发生在 Server 的 replicated Actor 上时, UE会把 该Actor 的 AttachmentReplication附着状态 同步到 Clients */
+		HandSocket->AttachActor(ActorToAttach, Character->GetMesh());
+	}
+}
+
+void UCombatComponent::PlayEquipWeaponSound(AWeapon* WeaponToEquip)
+{
+	// 播放装备音效
+	if (Character && WeaponToEquip && WeaponToEquip->EquipSound) {
+		UGameplayStatics::PlaySoundAtLocation(this, WeaponToEquip->EquipSound, Character->GetActorLocation());
+	}
+}
+
+void UCombatComponent::Reloading()
+{
+	if (CarriedAmmo > 0 && CombatState != ECombatState::ECS_Reloading && !bLocallyReloading) {
+		bLocallyReloading = true; // 本地防重入标志: 延迟过高时, 避免CombatState未能及时同步到本地客户端(仍为Unoccupied)而重复装填动作
+		HandleReloading();		  // 客户端预测: 本地机器立刻执行PlayReloadMontage()
+		ServerReloading();
+	}
+}
+
+void UCombatComponent::ServerReloading_Implementation()
+{
+	if (Character == nullptr || EquippedWeapon == nullptr) return;
+	CombatState = ECombatState::ECS_Reloading; // 只有Server才能修改CombatState
+	if (!Character->IsLocallyControlled()) {
+		HandleReloading(); // 避免 Listen Server上控制的角色 重复执行装填操作
+	}
+}
+
+void UCombatComponent::FinishReloading()
+{
+	if (Character == nullptr) return;
+	bLocallyReloading = false;
+	if (Character->HasAuthority()) {
+		CombatState = ECombatState::ECS_Unoccupied;
+		UpdateAmmoValues();
+	}
+	if (bFireButtonPressed) {
+		Fire(); // 如果一直按住开火键, 换弹完成继续持续射击 (因为 FireButtonPressed(bool bPressed) 只在 bPressed 被改变时调用)
+	}
+}
+
+void UCombatComponent::UpdateAmmoValues()
+{
+	if (Character == nullptr || EquippedWeapon == nullptr) return;
+	int32 ReloadAmount = AmountToReload();
+	if (CarriedAmmoMap.Contains(EquippedWeapon->GetWeaponType())) {
+		CarriedAmmoMap[EquippedWeapon->GetWeaponType()] -= ReloadAmount;
+		CarriedAmmo = CarriedAmmoMap[EquippedWeapon->GetWeaponType()];
+	}
+	Controller = (Controller == nullptr ? Cast<ABaseCharacterPlayerController>(Character->GetController()) : Controller);
+	if (Controller) {
+		Controller->SetHUDCarriedAmmo(CarriedAmmo);
+	}
+	EquippedWeapon->AddAmmo(ReloadAmount);
+}
+
+bool UCombatComponent::ShouldSwapWeapons()
+{
+	return (EquippedWeapon != nullptr && SecondaryWeapon != nullptr);
+}
+
+void UCombatComponent::OnRep_CombatState()
+{
+	switch (CombatState)
+	{
+	case ECombatState::ECS_Unoccupied:
+		if (bFireButtonPressed) {
+			Fire();
+		}
+		break;
+	case ECombatState::ECS_Reloading:
+		if (!Character->IsLocallyControlled()) HandleReloading(); // 本地机器无需重复执行装填操作
+		break;
+	case ECombatState::ECS_MAX:
+		break;
+	}
+}
+
+void UCombatComponent::HandleReloading()
+{
+	Character->PlayReloadMontage();
+}
+
+int32 UCombatComponent::AmountToReload()
+{
+	if (EquippedWeapon == nullptr) return 0;
+	int32 RoomInMag = EquippedWeapon->GetMagCapacity() - EquippedWeapon->GetAmmo(); // 计算Weapon还可装多少弹药
+	if (CarriedAmmoMap.Contains(EquippedWeapon->GetWeaponType())) {
+		int32 AmountCarried = CarriedAmmoMap[EquippedWeapon->GetWeaponType()];
+		return FMath::Clamp(RoomInMag, 0, AmountCarried); // 不能超过自身携带的该类型弹药
+	}
+	return 0;
+}
+
+void UCombatComponent::UpdateCarriedAmmo()
+{
+	if (EquippedWeapon == nullptr) return;
+
+	if (CarriedAmmoMap.Contains(EquippedWeapon->GetWeaponType())) {
+		CarriedAmmo = CarriedAmmoMap[EquippedWeapon->GetWeaponType()];
+	}
+	Controller = (Controller == nullptr ? Cast<ABaseCharacterPlayerController>(Character->Controller) : Controller);
+	if (Controller) {
+		Controller->SetHUDCarriedAmmo(CarriedAmmo);
+	}
 }
 
 void UCombatComponent::TraceUnderCrosshairs(FHitResult& TraceHitResult)
@@ -237,6 +454,11 @@ void UCombatComponent::InterpFOV(float DeltaTime)
 	}
 }
 
+bool UCombatComponent::CanFire()
+{
+	return !EquippedWeapon->IsMagEmpty() && bCanFire && CombatState == ECombatState::ECS_Unoccupied && !bLocallyReloading;
+}
+
 void UCombatComponent::StartFireTimer()
 {
 	if (EquippedWeapon == nullptr || Character == nullptr) return;
@@ -255,6 +477,26 @@ void UCombatComponent::FireTimerFinished()
 	if (bFireButtonPressed && EquippedWeapon->bAutomatic) { // 如果开火键仍然被按下 且 Weapon支持连发功能
 		Fire();
 	}
+	/* 自动换弹: 如果开火结束后, Weapon已没有子弹, 执行Reloading() */
+	if (EquippedWeapon->IsMagEmpty()) {
+		Reloading();
+	}
+}
+
+void UCombatComponent::OnRep_CarriedAmmo()
+{
+	Controller = (Controller == nullptr ? Cast<ABaseCharacterPlayerController>(Character->GetController()) : Controller);
+	if (Controller) {
+		Controller->SetHUDCarriedAmmo(CarriedAmmo);
+	}
+}
+
+void UCombatComponent::InitializeCarriedAmmo()
+{
+	// TMap::Emplace(Key, Value) 与 TMap::Add(Key, Value) 都用于添加或更新键值对
+	// Emplace() 的特点是尝试直接在容器内部构造 键值对(Key, Value), 减少临时对象的创建
+	CarriedAmmoMap.Emplace(EWeaponType::EWT_AssultRifle, StartingARAmmo);
+	CarriedAmmoMap.Emplace(EWeaponType::EWT_RocketLauncher, StartingRocketAmmo);
 }
 
 /*
@@ -268,6 +510,10 @@ void UCombatComponent::OnRep_EquippedWeapon()
 		if (HandSocket) {
 			HandSocket->AttachActor(EquippedWeapon, Character->GetMesh());
 		}
+	}
+	// 播放装备音效
+	if (EquippedWeapon->EquipSound) {
+		UGameplayStatics::PlaySoundAtLocation(this, EquippedWeapon->EquipSound, Character->GetActorLocation());
 	}
 }
 */

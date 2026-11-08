@@ -44,4 +44,6 @@ void UBaseCharacterAnimInstance::NativeUpdateAnimation(float DeltaTime)
 
 	AO_Yaw = BaseCharacter->GetAO_Yaw();
 	AO_Pitch = BaseCharacter->GetAO_Pitch();
+
+	bUseAimOffsets = BaseCharacter->GetCombatState() != ECombatState::ECS_Reloading; // »»µ¯Ê±½ûÓÃAimOffset
 }

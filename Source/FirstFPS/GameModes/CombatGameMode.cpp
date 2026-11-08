@@ -6,50 +6,66 @@
 #include "FirstFPS/Character/BaseCharacterPlayerController.h"
 #include "Kismet/GameplayStatics.h"
 #include "GameFramework/PlayerStart.h"
-#include "GameFramework/PlayerState.h"
+#include "FirstFPS/PlayerState/BaseCharacterPlayerState.h"
+#include "FirstFPS/GameStates/CombatGameState.h"
+
+namespace MatchState
+{
+	const FName Cooldown = FName(TEXT("Cooldown"));
+}
+
+ACombatGameMode::ACombatGameMode()
+{
+	/* 控制 Match 是否自动开始. 若为true, 玩家进入后 MatchState 不会从 WaitingToStart 过渡到 InProgress. 需要调用 StartMatch() 才能过渡到下一阶段 */
+	/* 勾选 DelayedStart 后: MatchState 处于 WaitingToStart 时, 玩家使用 SpectatorClass; 处于 InProgress 时, 玩家使用 DefaultPawnClass */
+	bDelayedStart = true;
+}
+
+void ACombatGameMode::Tick(float DeltaTime)
+{
+	Super::Tick(DeltaTime);
+
+	if (MatchState == MatchState::WaitingToStart) {
+		CountdownTime = WarmupTime - (GetWorld()->GetTimeSeconds() - LevelStartingTime);
+		if (CountdownTime <= 0.f) {
+			StartMatch(); // AGameMode自带函数, WaitingToStart → Inprogress
+		}
+	}
+	else if (MatchState == MatchState::InProgress) {
+		CountdownTime = WarmupTime + MatchTime - (GetWorld()->GetTimeSeconds() - LevelStartingTime);
+		if (CountdownTime <= 0.f) {
+			SetMatchState(MatchState::Cooldown); // Inprogress → Cooldown
+		}
+	}
+	else if (MatchState == MatchState::Cooldown) {
+		CountdownTime = WarmupTime + MatchTime + CooldownTime - (GetWorld()->GetTimeSeconds() - LevelStartingTime);
+		if (CountdownTime <= 0.f) {
+			RestartGame(); // AGameMode自带函数: 由Server重新进入当前地图, 并重新初始化各类
+			// P.S. 因为并没有调用 EndMatch(), 因此不会进入 WaitingPostMatch及其后续阶段
+		}
+	}
+}
 
 void ACombatGameMode::PlayerEliminated(ABaseCharacter* ElimmedCharacter, ABaseCharacterPlayerController* VictimController, ABaseCharacterPlayerController* AttackController)
 {
-	// 比赛已经结束后，不再处理新的淘汰和计分
-	if (HasMatchEnded())
-	{
-		return;
+	ABaseCharacterPlayerState* AttackerPlayerState = (AttackController ? Cast<ABaseCharacterPlayerState>(AttackController->PlayerState) : nullptr);
+	ABaseCharacterPlayerState* VictimPlayerState = (VictimController ? Cast<ABaseCharacterPlayerState>(VictimController->PlayerState) : nullptr);
+	ACombatGameState* CombatGameState = GetGameState<ACombatGameState>();
+	
+	if (AttackerPlayerState && AttackerPlayerState != VictimPlayerState && CombatGameState) { // 自杀不算作击杀
+		AttackerPlayerState->AddToScore(1.f);
+		CombatGameState->UpdateTopScore(AttackerPlayerState);
 	}
-
-	/*
-	 * 只有以下情况才给击杀者加分：
-	 * 1. AttackerController 有效；
-	 * 2. 不是自杀。
-	 */
-	if (AttackController &&
-		AttackController != VictimController)
-	{
-		APlayerState* AttackerPlayerState = AttackController->GetPlayerState<APlayerState>();
-
-		if (AttackerPlayerState)
-		{
-			const float NewScore =
-				AttackerPlayerState->GetScore() + 1.f;
-
-			AttackerPlayerState->SetScore(NewScore);
-
-			if (NewScore >= ScoreToWin)
-			{
-				FinishMatch(AttackerPlayerState);
-			}
-		}
+	if (VictimPlayerState) {
+		VictimPlayerState->AddToDeaths(1);
 	}
-
-	if (ElimmedCharacter)
-	{
-		// 最后一击即使结束了比赛，也应该播放淘汰表现
-		ElimmedCharacter->Elim();
+	if (ElimmedCharacter) {
+		ElimmedCharacter->Elim(); // 处理角色淘汰相关逻辑
 	}
 }
 
 void ACombatGameMode::RequestRespawn(ACharacter* ElimmedCharacter, AController* ElimmedController)
 {
-	/*
 	if (ElimmedCharacter) {
 		ElimmedCharacter->Reset();  // APawn::Reset(): 解除 Pawn 与 对应Controller 的控制关系, 并请求销毁 Pawn 
 		//ElimmedCharacter->Destroy();
@@ -62,105 +78,24 @@ void ACombatGameMode::RequestRespawn(ACharacter* ElimmedCharacter, AController* 
 		// 让 指定Controller 在 指定出生点位置 生成 新Pawn(GameMode设置的默认Pawn类型), 并控制该Pawn
 		RestartPlayerAtPlayerStart(ElimmedController, PlayerStarts[Selection]);
 	}
-	*/
-	// 比赛结束后不再生成新角色
-	if (HasMatchEnded())
-	{
-		return;
-	}
+}
 
-	if (ElimmedCharacter)
-	{
-		ElimmedCharacter->Reset();
-	}
+void ACombatGameMode::BeginPlay()
+{
+	Super::BeginPlay();
 
-	if (!ElimmedController)
-	{
-		return;
-	}
-
-	TArray<AActor*> PlayerStarts;
-
-	UGameplayStatics::GetAllActorsOfClass(
-		this,
-		APlayerStart::StaticClass(),
-		PlayerStarts
-	);
-
-	if (PlayerStarts.Num() == 0)
-	{
-		UE_LOG(
-			LogTemp,
-			Warning,
-			TEXT("RequestRespawn: 当前关卡中没有 PlayerStart")
-		);
-
-		return;
-	}
-
-	const int32 Selection =
-		FMath::RandRange(0, PlayerStarts.Num() - 1);
-
-	RestartPlayerAtPlayerStart(
-		ElimmedController,
-		PlayerStarts[Selection]
-	);
+	// 当 ACombatGameMode 开始运行时, 记录当前世界时间, 作为本局比赛开局倒计时的起始基准
+	LevelStartingTime = GetWorld()->GetTimeSeconds();
 }
 
 void ACombatGameMode::OnMatchStateSet()
 {
 	Super::OnMatchStateSet();
-
-	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It) { // 类型别名, 用于遍历游戏中所有的PlayerController 
+	/** FConstPlayerControllerIterator: 类型别名, 用于遍历游戏中所有的PlayerController */
+	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It) { 
 		ABaseCharacterPlayerController* BaseCharacterController = Cast<ABaseCharacterPlayerController>(*It);
 		if (BaseCharacterController) {
-			BaseCharacterController->OnMatchStateSet(MatchState); // 更新各PlayerController中的MatchState
+			BaseCharacterController->OnMatchStateSet(MatchState); // 更新 Server 中 各PlayerController 的 MatchState变量
 		}
-	}
-}
-void ACombatGameMode::FinishMatch(APlayerState* Winner)
-{
-	if (!Winner || HasMatchEnded())
-	{
-		return;
-	}
-
-	WinnerPlayerState = Winner;
-
-	/*
-	 * EndMatch 会将比赛从 InProgress 转换到赛后状态，
-	 * 并触发 ACombatGameMode::OnMatchStateSet()。
-	 */
-	EndMatch();
-
-	const FString WinnerName = Winner->GetPlayerName();
-
-	for (FConstPlayerControllerIterator It =
-		GetWorld()->GetPlayerControllerIterator();
-		It;
-		++It)
-	{
-		ABaseCharacterPlayerController* PlayerController =
-			Cast<ABaseCharacterPlayerController>(It->Get());
-
-		if (!PlayerController)
-		{
-			continue;
-		}
-
-		APlayerState* CurrentPlayerState =
-			PlayerController->GetPlayerState<APlayerState>();
-
-		const bool bIsWinner =
-			CurrentPlayerState == Winner;
-
-		/*
-		 * 每一个服务器端 PlayerController 都对应自己的 owning client。
-		 * 调用 Client RPC 后，结果会发送给对应客户端。
-		 */
-		PlayerController->ClientHandleMatchEnded(
-			bIsWinner,
-			WinnerName
-		);
 	}
 }
